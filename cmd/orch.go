@@ -42,7 +42,38 @@ func runOrch(cmd *cobra.Command, args []string) error {
 
 	// Check if tmux session already exists
 	if sessionExists(sessionName) {
-		fmt.Printf("Session %q already exists. Use 'session attach %s' to connect.\n", sessionName, sessionName)
+		// Check if claude is actually running in it
+		out, _ := exec.Command("tmux", "capture-pane", "-t", sessionName, "-p").Output()
+		pane := string(out)
+		claudeRunning := strings.Contains(pane, "claude") || strings.Contains(pane, "Claude") ||
+			strings.Contains(pane, "Tips:") || strings.Contains(pane, "/help") ||
+			strings.Contains(pane, "❯") || strings.Contains(pane, "What can I")
+		if claudeRunning {
+			fmt.Printf("Session %q already exists with Claude running. Use 'session attach %s' to connect.\n", sessionName, sessionName)
+			return nil
+		}
+		// Session exists but Claude isn't running — relaunch Claude in it
+		fmt.Printf("Session %q exists but Claude is not running. Relaunching...\n", sessionName)
+		claudeArgs := []string{}
+		if resume {
+			claudeArgs = append(claudeArgs, "--resume")
+		}
+		if skipPerms {
+			claudeArgs = append(claudeArgs, "--dangerously-skip-permissions")
+		}
+		relaunchCmd := "unset CLAUDECODE && claude " + strings.Join(claudeArgs, " ")
+		sendClaude := exec.Command("tmux", "send-keys", "-t", sessionName, relaunchCmd, "Enter")
+		if err := sendClaude.Run(); err != nil {
+			return fmt.Errorf("relaunching claude: %w", err)
+		}
+		if prompt == "" && !resume {
+			prompt = "You are the orchestrator. Read CLAUDE.md and let me know you're ready."
+		}
+		if prompt != "" {
+			waitAndSendPrompt(sessionName, prompt)
+		}
+		fmt.Printf("Relaunched orchestrator in session %q\n", sessionName)
+		fmt.Printf("Attach with: session attach %s\n", sessionName)
 		return nil
 	}
 
@@ -60,8 +91,12 @@ func runOrch(cmd *cobra.Command, args []string) error {
 
 	claudeCmd := "claude " + strings.Join(claudeArgs, " ")
 
-	if prompt == "" && !resume {
-		prompt = "You are the orchestrator. Read CLAUDE.md and let me know you're ready."
+	if prompt == "" {
+		if resume {
+			prompt = "Continue where you left off. Check inbox and let me know what's going on."
+		} else {
+			prompt = "You are the orchestrator. Read CLAUDE.md and let me know you're ready."
+		}
 	}
 
 	// Unset CLAUDECODE so the spawned session doesn't inherit it
@@ -84,47 +119,48 @@ func runOrch(cmd *cobra.Command, args []string) error {
 	}
 
 	if prompt != "" {
-		fmt.Printf("Waiting for Claude to start...")
-		promptSent := false
-		for i := 0; i < 60; i++ {
-			time.Sleep(1 * time.Second)
-			out, _ := exec.Command("tmux", "capture-pane", "-t", sessionName, "-p").Output()
-			pane := string(out)
-
-			// Handle trust prompt — press Enter to confirm
-			if strings.Contains(pane, "Yes, I trust this folder") {
-				exec.Command("tmux", "send-keys", "-t", sessionName, "Enter").Run()
-				fmt.Print("(trusted).")
-				continue
-			}
-
-			// Claude is ready when it shows the input prompt
-			lines := strings.Split(strings.TrimSpace(pane), "\n")
-			if len(lines) > 0 {
-				lastLine := strings.TrimSpace(lines[len(lines)-1])
-				if lastLine == ">" || lastLine == "❯" || lastLine == "" {
-					if strings.Contains(pane, "Tips:") || strings.Contains(pane, "/help") || strings.Contains(pane, "What can I") {
-						fmt.Println(" ready!")
-						time.Sleep(500 * time.Millisecond)
-						sendPrompt := exec.Command("tmux", "send-keys", "-t", sessionName, prompt, "Enter")
-						if err := sendPrompt.Run(); err != nil {
-							return fmt.Errorf("sending prompt: %w", err)
-						}
-						promptSent = true
-						break
-					}
-				}
-			}
-			fmt.Print(".")
-		}
-		if !promptSent {
-			fmt.Println(" timed out, sending prompt anyway.")
-			time.Sleep(500 * time.Millisecond)
-			exec.Command("tmux", "send-keys", "-t", sessionName, prompt, "Enter").Run()
-		}
+		waitAndSendPrompt(sessionName, prompt)
 	}
 
 	fmt.Printf("Started orchestrator session %q in %s\n", sessionName, orchDir)
 	fmt.Printf("Attach with: session attach %s\n", sessionName)
 	return nil
+}
+
+func waitAndSendPrompt(sessionName, prompt string) {
+	fmt.Printf("Waiting for Claude to start...")
+	promptSent := false
+	for i := 0; i < 60; i++ {
+		time.Sleep(1 * time.Second)
+		out, _ := exec.Command("tmux", "capture-pane", "-t", sessionName, "-p").Output()
+		pane := string(out)
+
+		// Handle trust prompt — press Enter to confirm
+		if strings.Contains(pane, "Yes, I trust this folder") {
+			exec.Command("tmux", "send-keys", "-t", sessionName, "Enter").Run()
+			fmt.Print("(trusted).")
+			continue
+		}
+
+		// Claude is ready when it shows the input prompt
+		lines := strings.Split(strings.TrimSpace(pane), "\n")
+		if len(lines) > 0 {
+			lastLine := strings.TrimSpace(lines[len(lines)-1])
+			if lastLine == ">" || lastLine == "❯" || lastLine == "" {
+				if strings.Contains(pane, "Tips:") || strings.Contains(pane, "/help") || strings.Contains(pane, "What can I") {
+					fmt.Println(" ready!")
+					time.Sleep(500 * time.Millisecond)
+					exec.Command("tmux", "send-keys", "-t", sessionName, prompt, "Enter").Run()
+					promptSent = true
+					break
+				}
+			}
+		}
+		fmt.Print(".")
+	}
+	if !promptSent {
+		fmt.Println(" timed out, sending prompt anyway.")
+		time.Sleep(500 * time.Millisecond)
+		exec.Command("tmux", "send-keys", "-t", sessionName, prompt, "Enter").Run()
+	}
 }
