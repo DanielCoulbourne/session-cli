@@ -79,6 +79,22 @@ func runStart(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Repo already exists at %s\n", repoDir)
 	}
 
+	// Enable Entire if available and not already enabled
+	if _, err := exec.LookPath("entire"); err == nil {
+		entireSettings := filepath.Join(repoDir, ".entire", "settings.json")
+		if _, err := os.Stat(entireSettings); os.IsNotExist(err) {
+			fmt.Printf("Enabling Entire for %s...\n", repoName)
+			enableCmd := exec.Command("entire", "enable", "--agent", "claude-code")
+			enableCmd.Dir = repoDir
+			enableCmd.Env = append(os.Environ(), "ACCESSIBLE=1")
+			enableCmd.Stdout = os.Stdout
+			enableCmd.Stderr = os.Stderr
+			if err := enableCmd.Run(); err != nil {
+				fmt.Printf("Warning: failed to enable Entire: %v\n", err)
+			}
+		}
+	}
+
 	// Build the claude command with system prompt for reporting
 	claudeArgs := []string{}
 	if resume {
