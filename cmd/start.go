@@ -15,7 +15,7 @@ var startCmd = &cobra.Command{
 	Use:   "start [org/repo]",
 	Short: "Start a Claude Code session for a project",
 	Long: `Clone the repo (if not already at ~/src/{repo}) and launch Claude Code
-in a new tmux session.
+in a new tmux session with access to shared tooling and a reporting channel.
 
 The repo argument can be:
   - org/repo (e.g. kathunk/tidy)
@@ -34,12 +34,16 @@ Examples:
 func init() {
 	startCmd.Flags().StringP("prompt", "p", "", "Initial prompt to send to Claude Code")
 	startCmd.Flags().Bool("resume", false, "Resume the most recent Claude Code conversation")
+	startCmd.Flags().Bool("dangerously-skip-permissions", false, "Skip all permission checks in the spawned session")
+	startCmd.Flags().StringSlice("env", nil, "Additional .env files to source (default: ~/orch/.env)")
 	rootCmd.AddCommand(startCmd)
 }
 
 func runStart(cmd *cobra.Command, args []string) error {
 	prompt, _ := cmd.Flags().GetString("prompt")
 	resume, _ := cmd.Flags().GetBool("resume")
+	skipPerms, _ := cmd.Flags().GetBool("dangerously-skip-permissions")
+	extraEnvFiles, _ := cmd.Flags().GetStringSlice("env")
 
 	repo := args[0]
 
@@ -54,6 +58,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Session %q already exists. Use 'session attach %s' to connect.\n", sessionName, sessionName)
 		return nil
 	}
+
+	// Ensure inbox directory exists
+	os.MkdirAll(inboxDir, 0755)
 
 	// Clone if needed
 	if _, err := os.Stat(repoDir); os.IsNotExist(err) {
@@ -72,24 +79,36 @@ func runStart(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Repo already exists at %s\n", repoDir)
 	}
 
-	// Build the claude command
-	// Claude Code runs interactively by default (no args).
-	// We start it interactively in tmux, then send the prompt as keystrokes.
-	claudeArgs := ""
+	// Build the claude command with system prompt for reporting
+	claudeArgs := []string{}
 	if resume {
-		claudeArgs = "--resume"
+		claudeArgs = append(claudeArgs, "--resume")
+	}
+	if skipPerms {
+		claudeArgs = append(claudeArgs, "--dangerously-skip-permissions")
 	}
 
-	claudeCmd := "claude"
-	if claudeArgs != "" {
-		claudeCmd = "claude " + claudeArgs
-	}
+	// Inject system prompt with tooling and reporting instructions
+	systemPrompt := buildSystemPrompt(sessionName)
+	claudeArgs = append(claudeArgs, "--append-system-prompt", shelljoin([]string{systemPrompt}))
+
+	claudeCmd := "claude " + strings.Join(claudeArgs, " ")
 
 	if prompt == "" && !resume {
 		prompt = fmt.Sprintf("You are working on the %s project. Read CLAUDE.md if it exists and let me know you're ready.", repoName)
 	}
 
-	// Create tmux session with a shell first, then launch claude
+	// Build env setup command — source orch .env + any extra env files
+	envSetup := "unset CLAUDECODE"
+	orchEnv := filepath.Join(orchDir, ".env")
+	if _, err := os.Stat(orchEnv); err == nil {
+		envSetup += fmt.Sprintf(" && set -a && source %s && set +a", orchEnv)
+	}
+	for _, envFile := range extraEnvFiles {
+		envSetup += fmt.Sprintf(" && set -a && source %s && set +a", envFile)
+	}
+
+	// Create tmux session with a shell
 	tmuxCmd := exec.Command("tmux", "new-session", "-d", "-s", sessionName, "-c", repoDir)
 	tmuxCmd.Stdout = os.Stdout
 	tmuxCmd.Stderr = os.Stderr
@@ -97,9 +116,10 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("creating tmux session: %w", err)
 	}
 
-	// Send the claude command — unset CLAUDECODE to avoid nested session detection
+	// Source env vars and launch claude
 	time.Sleep(500 * time.Millisecond)
-	sendClaude := exec.Command("tmux", "send-keys", "-t", sessionName, "unset CLAUDECODE && "+claudeCmd, "Enter")
+	launchCmd := fmt.Sprintf("%s && %s", envSetup, claudeCmd)
+	sendClaude := exec.Command("tmux", "send-keys", "-t", sessionName, launchCmd, "Enter")
 	if err := sendClaude.Run(); err != nil {
 		return fmt.Errorf("launching claude: %w", err)
 	}
@@ -120,13 +140,10 @@ func runStart(cmd *cobra.Command, args []string) error {
 			}
 
 			// Claude is ready when it shows the input prompt
-			// Look for the empty prompt line (claude waits for input)
 			lines := strings.Split(strings.TrimSpace(pane), "\n")
 			if len(lines) > 0 {
 				lastLine := strings.TrimSpace(lines[len(lines)-1])
-				// Claude's input prompt is typically an empty line or just ">"
 				if lastLine == ">" || lastLine == "❯" || lastLine == "" {
-					// Check if claude has finished loading (shows tips or has rendered UI)
 					if strings.Contains(pane, "Tips:") || strings.Contains(pane, "/help") || strings.Contains(pane, "What can I") {
 						fmt.Println(" ready!")
 						time.Sleep(500 * time.Millisecond)
@@ -153,6 +170,39 @@ func runStart(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func buildSystemPrompt(sessionName string) string {
+	return fmt.Sprintf(`## Orchestrator Integration
+
+You were launched by the orchestrator session. You have access to shared tooling and a reporting channel.
+
+### Shared Tooling
+- The 'linear' CLI is available at /usr/local/bin/linear for project management tasks.
+  Run 'linear --help' for usage. Use '-o json' for machine-readable output.
+  API keys are pre-configured in your environment.
+
+### Reporting Back
+When you complete a task, hit a blocker, or have something the orchestrator needs to know,
+write a report file to the inbox:
+
+  Write a file to: %s/{timestamp}-{brief-slug}.md
+
+Format:
+  # {Session}: {Brief Title}
+  Status: completed | blocked | update | question
+
+  {Details}
+
+Use the Bash tool to write reports:
+  echo '...' > %s/$(date +%%Y%%m%%d-%%H%%M%%S)-{slug}.md
+
+Only report when you have something meaningful — don't spam the inbox.
+The orchestrator will check it periodically.
+
+### Session Identity
+Your session name is: %s
+`, inboxDir, inboxDir, sessionName)
+}
+
 func parseRepo(repo string) (org, name string) {
 	// Strip GitHub URL prefix
 	repo = strings.TrimPrefix(repo, "https://github.com/")
@@ -167,7 +217,6 @@ func parseRepo(repo string) (org, name string) {
 }
 
 func sanitizeSessionName(name string) string {
-	// tmux session names can't have dots or colons
 	name = strings.ReplaceAll(name, ".", "-")
 	name = strings.ReplaceAll(name, ":", "-")
 	return name
