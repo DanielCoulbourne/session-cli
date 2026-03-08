@@ -198,9 +198,36 @@ Use the Bash tool to write reports:
 Only report when you have something meaningful — don't spam the inbox.
 The orchestrator will check it periodically.
 
+### Heartbeat
+While actively working, update a heartbeat file approximately every 5 minutes so the orchestrator
+can monitor your status at a glance. Also update it immediately whenever your task status changes
+(e.g. you become blocked, complete a task, start idling, etc.).
+
+Write/overwrite (not append) this file:
+  %s/heartbeat-%s.md
+
+Format (exactly):
+  # %s: Heartbeat
+  Last active: {ISO 8601 timestamp, e.g. 2026-03-08T14:30:00Z}
+  Status: working | idle | blocked | completed
+  Current task: {brief one-line description of what you're doing}
+
+Use the Bash tool to write it:
+  cat > %s/heartbeat-%s.md << 'HEARTBEAT'
+  # %s: Heartbeat
+  Last active: $(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)
+  Status: working
+  Current task: implementing login fix
+  HEARTBEAT
+
 ### Session Identity
 Your session name is: %s
-`, inboxDir, inboxDir, sessionName)
+`, inboxDir, inboxDir,
+		inboxDir, sessionName,
+		sessionName,
+		inboxDir, sessionName,
+		sessionName,
+		sessionName)
 }
 
 func parseRepo(repo string) (org, name string) {
